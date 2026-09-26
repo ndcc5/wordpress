@@ -3,6 +3,10 @@
 # WordPress 自动安装脚本
 # 用于在 Oracle VM 上快速安装 WordPress 的脚本。
 
+# 非交互模式：避免 apt/needrestart 弹出对话框中断安装
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -170,7 +174,38 @@ sleep 1
 
 # 系统更新
 log "正在更新系统..."
-apt update -y && apt upgrade -y || error "系统更新失败"
+
+# 尝试禁用不可达的第三方源（例如 deb.nodesource.com，本脚本并不需要 Node.js）
+disable_node_source() {
+    rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
+    sed -i '/deb\.nodesource\.com/d' /etc/apt/sources.list
+    log "已移除 NodeSource 软件源。"
+}
+
+if ! apt update -y; then
+    warn "apt update 失败，3 秒后重试一次..."
+    sleep 3
+    if ! apt update -y; then
+        warn "仍然失败，常见原因是第三方软件源不可达（如 deb.nodesource.com）。"
+        drop_src=$(get_input "是否禁用 NodeSource 源并继续? (安装 WordPress 不需要 Node.js) (y/n)" "y")
+        if [ "$drop_src" = "y" ] || [ "$drop_src" = "Y" ]; then
+            disable_node_source
+            apt update -y || error "apt update 仍然失败，请手动检查 /etc/apt/sources.list.d/ 下的软件源"
+        else
+            error "请修复软件源后重新运行本脚本。"
+        fi
+    fi
+fi
+
+if ! apt upgrade -y; then
+    warn "部分软件包升级失败（通常是第三方源不可达，例如 deb.nodesource.com）。"
+    cont=$(get_input "是否忽略升级错误，继续安装 WordPress? (y/n)" "y")
+    if [ "$cont" = "y" ] || [ "$cont" = "Y" ]; then
+        warn "已跳过系统升级，继续执行安装。"
+    else
+        error "已中止安装。请修复软件源后重新运行本脚本。"
+    fi
+fi
 
 # 设置时区
 log "正在设置时区..."
