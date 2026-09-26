@@ -93,6 +93,9 @@ db_name="$db_name"
 db_user="$db_user"
 db_password="$db_password"
 
+# 数据库远程访问设置
+allow_remote_db="$allow_remote_db"
+
 # DDNS 设置
 use_ddns="$use_ddns"
 ddns_provider="$ddns_provider"
@@ -103,6 +106,35 @@ EOF
 
     chmod 600 "$config_file"
     log "配置已保存到文件: $config_file"
+}
+
+# 转义函数：避免密码中的特殊字符破坏 SQL 语句
+sql_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\'/\\\'}
+    printf '%s' "$s"
+}
+
+# 转义函数：避免密码中的 & 和 \ 被 sed 当成特殊字符
+sed_escape_replacement() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//&/\\&}
+    printf '%s' "$s"
+}
+
+# 替换文件中的占位符，自动挑选密码里不存在的分隔符
+replace_placeholder() {
+    local pattern="$1" value="$2" file="$3"
+    local esc delim
+    esc=$(sed_escape_replacement "$value")
+    for delim in '/' '|' '#' '@' '%' ',' ':' '_' ';' '~'; do
+        case "$esc" in *"$delim"*) continue ;; esac
+        sed -i "s${delim}${pattern}${delim}${esc}${delim}g" "$file"
+        return 0
+    done
+    return 1
 }
 
 # 检查管理员权限
@@ -130,6 +162,7 @@ if load_config "$config_file"; then
     echo "数据库名称: $db_name"
     echo "数据库用户: $db_user"
     echo "是否使用 DDNS: $use_ddns"
+    echo "数据库远程访问: ${allow_remote_db:-y}"
     
     use_loaded_config=$(get_input "是否使用这些配置? (y/n)" "y")
     if [ "$use_loaded_config" != "y" ] && [ "$use_loaded_config" != "Y" ]; then
@@ -151,6 +184,12 @@ if [ "$config_loaded" = false ]; then
     db_user=$(get_input "数据库用户名" "wordpress")
     db_password=$(get_password "数据库密码")
 
+    # 是否开启数据库远程访问（高风险）
+    echo ""
+    warn "数据库远程访问：将允许任意 IP 连接数据库，并开放 root 远程登录。"
+    warn "该配置风险很高，仅建议在内网或测试环境使用！"
+    allow_remote_db=$(get_input "是否开启数据库远程访问? (y/n)" "y")
+
     # 是否使用 DDNS
     use_ddns=$(get_input "是否使用 DDNS? (y/n)" "n")
 
@@ -167,6 +206,11 @@ if [ "$config_loaded" = false ]; then
         save_config "$config_file"
     fi
 fi
+
+# 去除密码首尾空白与换行（粘贴输入时可能带入）
+db_password=$(printf '%s' "$db_password" | tr -d '\r\n')
+db_name=$(printf '%s' "$db_name" | tr -d '\r\n')
+db_user=$(printf '%s' "$db_user" | tr -d '\r\n')
 
 echo ""
 log "开始安装..."
@@ -285,8 +329,9 @@ fi
 
 # MariaDB 安全设置
 log "正在进行 MariaDB 安全设置..."
-mysql --user=root <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$db_password';
+db_password_sql=$(sql_escape "$db_password")
+mysql --user=root <<EOF || warn "MariaDB 安全设置执行异常，请稍后检查 root 认证方式"
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$db_password_sql';
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
@@ -296,12 +341,60 @@ EOF
 
 # 创建数据库和用户
 log "正在创建 WordPress 数据库..."
-mysql --user=root --password="$db_password" <<EOF
-CREATE DATABASE $db_name DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_password';
+mysql --user=root --password="$db_password" <<EOF || error "创建数据库失败，请检查 MariaDB root 认证方式"
+CREATE DATABASE IF NOT EXISTS $db_name DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$db_user'@'localhost' IDENTIFIED BY '$db_password_sql';
+ALTER USER '$db_user'@'localhost' IDENTIFIED BY '$db_password_sql';
 GRANT ALL ON $db_name.* TO '$db_user'@'localhost';
 FLUSH PRIVILEGES;
 EOF
+
+# 数据库远程访问设置（允许任意 IP 连接、允许远程用户登录）
+allow_remote_db=${allow_remote_db:-y}
+if [ "$allow_remote_db" = "y" ] || [ "$allow_remote_db" = "Y" ]; then
+    log "正在开启数据库远程访问..."
+    warn "数据库将监听 0.0.0.0:3306，root 与 $db_user 均可从任意 IP 登录，仅限内网/测试环境！"
+
+    # 1) 创建可从任意主机登录的账号（MySQL 不支持"任意用户名"，需逐个账号授权到 %）
+    mysql --user=root --password="$db_password" <<EOF || warn "远程账号创建失败，请手动检查"
+CREATE USER IF NOT EXISTS '$db_user'@'%' IDENTIFIED BY '$db_password_sql';
+ALTER USER '$db_user'@'%' IDENTIFIED BY '$db_password_sql';
+GRANT ALL PRIVILEGES ON $db_name.* TO '$db_user'@'%';
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '$db_password_sql';
+ALTER USER 'root'@'%' IDENTIFIED BY '$db_password_sql';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+
+    # 2) 监听所有网卡
+    db_conf=$(grep -rlE "^[[:space:]]*bind-address" /etc/mysql/ 2>/dev/null | head -1)
+    if [ -z "$db_conf" ]; then
+        db_conf="/etc/mysql/mariadb.conf.d/50-server.cnf"
+    fi
+    if [ -f "$db_conf" ]; then
+        cp "$db_conf" "${db_conf}.bak.$(date +%s)"
+        if grep -qE "^[[:space:]]*bind-address" "$db_conf"; then
+            sed -i 's/^[[:space:]]*bind-address.*/bind-address = 0.0.0.0/' "$db_conf"
+        else
+            printf '\n[mysqld]\nbind-address = 0.0.0.0\n' >> "$db_conf"
+        fi
+        sed -i 's/^[[:space:]]*skip-networking/#skip-networking/' "$db_conf"
+        log "已修改 $db_conf -> bind-address = 0.0.0.0"
+    else
+        warn "未找到 MariaDB 配置文件，请手动设置 bind-address = 0.0.0.0"
+    fi
+
+    # 3) 防火墙放行 3306
+    ufw allow 3306/tcp
+    ufw reload
+
+    # 4) 重启并验证
+    systemctl restart mariadb
+    sleep 3
+    ss -lntp | grep 3306 || warn "未检测到 3306 端口监听，请检查 MariaDB 配置"
+    mysql --user=root --password="$db_password" -e "SELECT user,host FROM mysql.user;" 2>/dev/null | grep '%'
+    log "数据库远程访问已开启（3306 端口，任意 IP）。"
+fi
 
 # 下载并安装 WordPress
 log "正在下载并安装 WordPress..."
@@ -317,17 +410,58 @@ chmod -R 755 /var/www/wordpress/
 
 # 生成 wp-config.php
 log "正在生成 WordPress 配置文件..."
-cp /var/www/wordpress/wp-config-sample.php /var/www/wordpress/wp-config.php
-sed -i "s/database_name_here/$db_name/g" /var/www/wordpress/wp-config.php
-sed -i "s/username_here/$db_user/g" /var/www/wordpress/wp-config.php
-sed -i "s/password_here/$db_password/g" /var/www/wordpress/wp-config.php
+wp_config="/var/www/wordpress/wp-config.php"
+cp /var/www/wordpress/wp-config-sample.php "$wp_config"
+
+# 用 python3 做纯文本替换，彻底避免密码中的 & / \ 等特殊字符破坏 sed
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$wp_config" "$db_name" "$db_user" "$db_password" <<'PY'
+import sys
+path, name, user, pwd = sys.argv[1:5]
+with open(path, encoding='utf-8') as f:
+    s = f.read()
+s = s.replace('database_name_here', name)
+s = s.replace('username_here', user)
+s = s.replace('password_here', pwd)
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(s)
+PY
+else
+    replace_placeholder "database_name_here" "$db_name" "$wp_config" || error "数据库名称替换失败"
+    replace_placeholder "username_here" "$db_user" "$wp_config" || error "数据库用户名替换失败"
+    replace_placeholder "password_here" "$db_password" "$wp_config" || error "数据库密码替换失败，密码包含过多特殊字符，请更换密码后重试"
+fi
+
+if grep -qE "database_name_here|username_here|password_here" "$wp_config"; then
+    error "wp-config.php 中仍存在未替换的占位符，请检查后重试。"
+fi
+if grep -qE "define\( 'DB_PASSWORD', '' \)" "$wp_config"; then
+    error "数据库密码为空，请重新运行脚本并输入有效密码。"
+fi
+grep -E "DB_NAME|DB_USER" "$wp_config"
+log "DB_PASSWORD 已写入（出于安全不打印）"
 
 # 生成安全密钥
 log "正在生成安全密钥..."
-KEYS=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
-KEYS=$(echo "$KEYS" | sed "s/[\']/\\\'/g")
-sed -i "/define( 'AUTH_KEY'/,/define( 'NONCE_SALT'/ { d; }" /var/www/wordpress/wp-config.php
-echo "$KEYS" >> /var/www/wordpress/wp-config.php
+KEYS=$(curl -s --max-time 20 https://api.wordpress.org/secret-key/1.1/salt/)
+
+# 取不到（网络受限）时用本地随机值兜底
+if [ -z "$KEYS" ] || ! echo "$KEYS" | grep -q "AUTH_KEY"; then
+    warn "无法从 WordPress 官方获取安全密钥，正在本地生成随机密钥。"
+    gen_key() { head -c 48 /dev/urandom | base64 | tr -d '\n' | head -c 64; }
+    KEYS="define('AUTH_KEY',         '$(gen_key)');
+define('SECURE_AUTH_KEY',  '$(gen_key)');
+define('LOGGED_IN_KEY',    '$(gen_key)');
+define('NONCE_KEY',        '$(gen_key)');
+define('AUTH_SALT',        '$(gen_key)');
+define('SECURE_AUTH_SALT', '$(gen_key)');
+define('LOGGED_IN_SALT',   '$(gen_key)');
+define('NONCE_SALT',       '$(gen_key)');"
+fi
+
+# 删除示例密钥行后写入新密钥
+sed -i "/define( 'AUTH_KEY'/,/define( 'NONCE_SALT'/d" "$wp_config"
+echo "$KEYS" >> "$wp_config"
 
 # 添加内存限制
 echo "define('WP_MEMORY_LIMIT', '1024M');" >> /var/www/wordpress/wp-config.php
@@ -401,6 +535,12 @@ echo "域名: $domain"
 echo "数据库名称: $db_name"
 echo "数据库用户: $db_user"
 echo "WordPress 目录: /var/www/wordpress"
+if [ "$allow_remote_db" = "y" ] || [ "$allow_remote_db" = "Y" ]; then
+    echo "数据库远程访问: 已开启"
+    echo "  监听地址: 0.0.0.0:3306（任意 IP 可连接）"
+    echo "  远程账号: $db_user / root（密码与数据库密码相同）"
+    echo "  云服务器还需在控制台安全组/安全列表放行 3306 端口"
+fi
 echo ""
 echo "后续步骤:"
 echo "1. DNS 设置完成后，请使用以下命令安装 SSL 证书:"
@@ -426,6 +566,10 @@ log_file="wp-setup-$(date +%Y%m%d%H%M%S).log"
     echo "数据库名称: $db_name"
     echo "数据库用户: $db_user"
     echo "WordPress 目录: /var/www/wordpress"
+    echo "数据库远程访问: $allow_remote_db"
+    if [ "$allow_remote_db" = "y" ] || [ "$allow_remote_db" = "Y" ]; then
+        echo "数据库监听: 0.0.0.0:3306"
+    fi
     echo "是否使用 DDNS: $use_ddns"
     if [ "$use_ddns" = "y" ] || [ "$use_ddns" = "Y" ]; then
         echo "DDNS 服务商: $ddns_provider"
